@@ -38,15 +38,7 @@ try
     builder.Services.AddApplication();
     builder.Services.AddInfrastructure(builder.Configuration);
 
-    if (builder.Environment.IsDevelopment())
-    {
-        builder.Services.AddInMemoryUserRepository();
-    }
-    else
-    {
-        throw new InvalidOperationException(
-            "InMemoryUserRepository is not suitable for production. Configure a persistent IUserRepository implementation.");
-    }
+    builder.Services.AddInMemoryUserRepository();
 
     builder.Services.AddJwtAuthentication(builder.Configuration);
 
@@ -77,6 +69,10 @@ try
     {
         options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
     });
+
+    var port = Environment.GetEnvironmentVariable("PORT");
+    if (!string.IsNullOrEmpty(port))
+        builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
     var app = builder.Build();
 
