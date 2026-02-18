@@ -23,10 +23,10 @@ jobs:
           dotnet-version: 8.0.x
 
       - name: Restore dependencies
-        run: dotnet restore CurrencyConverter.slnx
+        run: dotnet restore CurrencyConverter.sln
 
       - name: Build
-        run: dotnet build CurrencyConverter.slnx --no-restore --configuration Release
+        run: dotnet build CurrencyConverter.sln --no-restore --configuration Release
 
   test:
     name: Unit Tests
@@ -45,10 +45,10 @@ jobs:
           dotnet-version: 8.0.x
 
       - name: Restore dependencies
-        run: dotnet restore CurrencyConverter.slnx
+        run: dotnet restore CurrencyConverter.sln
 
       - name: Build
-        run: dotnet build CurrencyConverter.slnx --no-restore --configuration Release
+        run: dotnet build CurrencyConverter.sln --no-restore --configuration Release
 
       - name: Run unit tests
         run: dotnet test tests/CurrencyConverter.UnitTests/CurrencyConverter.UnitTests.csproj --no-build --configuration Release --verbosity normal
