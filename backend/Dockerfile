@@ -1,12 +1,11 @@
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 
-COPY backend/CurrencyConverter.sln .
 COPY backend/src/CurrencyConverter.API/CurrencyConverter.API.csproj src/CurrencyConverter.API/
 COPY backend/src/CurrencyConverter.Application/CurrencyConverter.Application.csproj src/CurrencyConverter.Application/
 COPY backend/src/CurrencyConverter.Domain/CurrencyConverter.Domain.csproj src/CurrencyConverter.Domain/
 COPY backend/src/CurrencyConverter.Infrastructure/CurrencyConverter.Infrastructure.csproj src/CurrencyConverter.Infrastructure/
-RUN dotnet restore CurrencyConverter.sln
+RUN dotnet restore src/CurrencyConverter.API/CurrencyConverter.API.csproj
 
 COPY backend/ .
 RUN dotnet publish src/CurrencyConverter.API/CurrencyConverter.API.csproj -c Release -o /app/publish --no-restore
