@@ -13,7 +13,8 @@ RUN npm run build
 FROM nginx:alpine AS runtime
 COPY --from=build /app/dist /usr/share/nginx/html
 
-RUN echo 'server { \
+RUN mkdir -p /etc/nginx/templates && \
+    echo 'server { \
     listen ${PORT:-80}; \
     root /usr/share/nginx/html; \
     index index.html; \
