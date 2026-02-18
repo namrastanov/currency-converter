@@ -6,7 +6,7 @@ COPY backend/src/CurrencyConverter.API/CurrencyConverter.API.csproj src/Currency
 COPY backend/src/CurrencyConverter.Application/CurrencyConverter.Application.csproj src/CurrencyConverter.Application/
 COPY backend/src/CurrencyConverter.Domain/CurrencyConverter.Domain.csproj src/CurrencyConverter.Domain/
 COPY backend/src/CurrencyConverter.Infrastructure/CurrencyConverter.Infrastructure.csproj src/CurrencyConverter.Infrastructure/
-RUN dotnet restore
+RUN dotnet restore CurrencyConverter.slnx
 
 COPY backend/ .
 RUN dotnet publish src/CurrencyConverter.API/CurrencyConverter.API.csproj -c Release -o /app/publish --no-restore
