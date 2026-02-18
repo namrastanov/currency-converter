@@ -1,0 +1,54 @@
+name: Backend Build & Test
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - backend/**
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore CurrencyConverter.slnx
+
+      - name: Build
+        run: dotnet build CurrencyConverter.slnx --no-restore --configuration Release
+
+  test:
+    name: Unit Tests
+    needs: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore CurrencyConverter.slnx
+
+      - name: Build
+        run: dotnet build CurrencyConverter.slnx --no-restore --configuration Release
+
+      - name: Run unit tests
+        run: dotnet test tests/CurrencyConverter.UnitTests/CurrencyConverter.UnitTests.csproj --no-build --configuration Release --verbosity normal
