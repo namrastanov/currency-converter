@@ -26,6 +26,31 @@
 
 ---
 
+## Getting Started
+
+### Prerequisites
+
+- [.NET 8+ SDK](https://dotnet.microsoft.com/download)
+- [Node.js 18+](https://nodejs.org/)
+- [Redis](https://redis.io/) running on `localhost:6379`
+
+### Back-end
+
+```bash
+cd backend/src/CurrencyConverter.API
+dotnet run
+```
+
+### Front-end
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+---
+
 ## Human-Resolved Problems
 
 ### Pagination
