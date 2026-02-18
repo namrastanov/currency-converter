@@ -6,6 +6,7 @@
 currency-converter/
 ├── backend/                  # ASP.NET Core 8 Web API
 │   ├── CurrencyConverter.sln
+│   ├── Dockerfile
 │   ├── src/
 │   │   ├── CurrencyConverter.Domain/
 │   │   ├── CurrencyConverter.Application/
@@ -15,7 +16,11 @@ currency-converter/
 │       ├── CurrencyConverter.UnitTests/
 │       └── CurrencyConverter.IntegrationTests/
 ├── frontend/                 # React + TypeScript (Vite)
-├── docker-compose.yml        # API + Frontend + Redis
+│   └── Dockerfile
+├── .github/workflows/        # CI pipelines
+│   ├── backend-tests.yml
+│   └── frontend-tests.yml
+├── DEVELOPMENT_PLAN.md
 ├── .gitignore
 └── README.md
 ```
@@ -26,8 +31,8 @@ currency-converter/
 
 | Layer | Responsibility | Dependencies |
 |---|---|---|
-| Domain | Models (Currency, ExchangeRate, User), interfaces (ICurrencyProvider), business rules (excluded currencies), constants (AppRoles), custom exceptions (CurrencyNotSupportedException, InvalidCredentialsException, UserAlreadyExistsException) | None |
-| Application | Use cases (currency + auth), DTO/query/command objects, validation (FluentValidation), port interfaces (ICacheService, ICurrencyProviderFactory, IUserRepository, IJwtTokenService, IPasswordHasher), settings (JwtSettings, CacheSettings) | Domain |
+| Domain | Models (Currency, ExchangeRate, User, Result/Result&lt;T&gt;), interfaces (ICurrencyProvider), business rules (excluded currencies), constants (AppRoles), custom exceptions (CurrencyNotSupportedException, InvalidCredentialsException, UserAlreadyExistsException, ExternalApiException) | None |
+| Application | Use cases (currency + auth + admin), DTO/query/command objects, validation (FluentValidation), port interfaces (ICacheService, ICurrencyProviderFactory, IUserRepository, IJwtTokenService, IPasswordHasher), settings (JwtSettings, CacheSettings, CurrencyProviderSettings) | Domain |
 | Infrastructure | Frankfurter HTTP client, Redis cache implementation, resilience policies (Microsoft.Extensions.Http.Resilience), provider factory, auth implementations (JwtTokenService, BCryptPasswordHasher, InMemoryUserRepository) | Domain, Application |
 | API | Thin controllers, middleware (JWT Bearer config, logging, correlation, exception handling), DI composition root | All layers |
 
@@ -37,53 +42,61 @@ currency-converter/
 
 ### 1.1 Domain Layer
 
-- Define core models: `ExchangeRate`, `ConversionResult`, `Currency`, `PaginatedResult<T>`, `User`
+- Define core models: `ExchangeRate`, `ConversionResult`, `Currency`, `PaginatedResult<T>`, `User`, `Result` / `Result<T>`
 - `User` entity with properties: `Id` (Guid, init), `Username` (init), `PasswordHash` (init), `Role` (mutable via `ChangeRole()` method), `CreatedAt` (init)
+- `Result` / `Result<T>` — functional result pattern with `IsSuccess`, `Error`, `ErrorCode`, `IsFailure`; used by auth and admin use cases instead of throwing exceptions for business-logic failures
 - Define `ICurrencyProvider` interface with four operations: get currencies list, get latest rates, convert, get historical rates
 - Each provider must expose a `ProviderName` property for factory resolution
 - Create `CurrencyRestrictions` static class with frozen set of excluded currencies (TRY, PLN, THB, MXN)
+  - Exposes `IsRestricted(string)` and `GetExcludedCurrencies()` methods
   - This is a **business rule**, not infrastructure concern — it belongs in Domain
   - All four currencies exist in Frankfurter API; the exclusion is purely our business decision
-- Create `AppRoles` constants class with `Admin` and `User` roles
+- Create `AppRoles` constants class with `Admin`, `User` roles and `DefaultAdminUsername` constant
 - Create custom exceptions: `CurrencyNotSupportedException`, `ExternalApiException`, `InvalidCredentialsException`, `UserAlreadyExistsException`
 
 ### 1.2 Application Layer
 
 - Define port interfaces:
-  - `ICacheService` (Get/Set with TTL) — for currency rate caching
+  - `ICacheService` (Get/Set with TTL + range-aware historical operations) — for currency rate caching
   - `ICurrencyProviderFactory` (resolve by name) — for currency provider resolution
-  - `IUserRepository` — pure CRUD: `GetByUsername`, `GetById`, `GetAll`, `Create`, `UpdateRole`, `Delete` (operates on `Domain.Models.User`)
+  - `IUserRepository` — pure CRUD: `GetByUsername`, `GetById`, `GetAll`, `Create`, `TryCreate` (returns `(bool Created, User User)` tuple for atomic check-and-create), `UpdateRole`, `Delete` (operates on `Domain.Models.User`)
   - `IJwtTokenService` — `string GenerateToken(User user)`
   - `IPasswordHasher` — `string Hash(string password)`, `bool Verify(string password, string hash)` (extracted for SRP)
-- Define `JwtSettings` configuration class in `Application/Settings/` — both Infrastructure (`JwtTokenService`) and API (`AddJwtBearer`) depend on Application, so both can access it
-- Implement **ten use cases** as separate classes:
+- Define settings classes in `Application/Settings/`:
+  - `JwtSettings` (Secret, Issuer, Audience, ExpirationMinutes) — both Infrastructure (`JwtTokenService`) and API (`AddJwtBearer`) depend on Application, so both can access it
+  - `CacheSettings` (LatestRatesTtlMinutes, CurrenciesTtlMinutes, GapMergeThresholdDays)
+  - `CurrencyProviderSettings` (DefaultProvider)
+- Implement **eleven use cases** as separate classes:
   - **GetCurrenciesUseCase** — fetches available currencies from provider (cached), marks restricted currencies in response
   - **GetLatestRatesUseCase** — validates base currency against restrictions, checks cache, calls provider, caches result
   - **ConvertCurrencyUseCase** — validates both source AND target currency, delegates to provider
-  - **GetHistoricalRatesUseCase** — validates currency + date range, detects cached vs uncached date gaps via `ICacheService`, fetches only missing sub-ranges from provider, stores new data, merges cached + fresh results, applies pagination (Skip/Take)
-  - **LoginUseCase** — validates credentials via `IUserRepository` + `IPasswordHasher`, generates JWT via `IJwtTokenService`, throws `InvalidCredentialsException` on failure
-  - **RegisterUseCase** — checks username uniqueness, hashes password, creates user, generates JWT, throws `UserAlreadyExistsException` if username taken
-  - **GetAllUsersUseCase** — returns all users mapped to `UserDto`
-  - **GetUserByIdUseCase** — returns single user by ID or null
-  - **UpdateUserRoleUseCase** — validates role against `AppRoles`, updates user role
-  - **DeleteUserUseCase** — prevents self-deletion (business rule), deletes user by ID
+  - **GetHistoricalRatesUseCase** — validates currency + date range, detects cached vs uncached date gaps via `ICacheService`, fetches only missing sub-ranges from provider, stores new data, merges cached + fresh results, applies pagination (Skip/Take). Uses `TimeProvider` for today's date detection. Accepts `TimezoneOffset` parameter to correctly determine "today" relative to the user's timezone
+  - **LoginUseCase** — validates credentials via `IUserRepository` + `IPasswordHasher`, generates JWT via `IJwtTokenService`; returns `Result<AuthResult>` (Failure with `INVALID_CREDENTIALS` error code on invalid credentials — uses Result pattern instead of throwing exceptions)
+  - **RegisterUseCase** — uses `IUserRepository.TryCreate` for atomic uniqueness check, hashes password, creates user with default `User` role, generates JWT; returns `Result<AuthResult>` (Failure with `USER_ALREADY_EXISTS` error code if username taken)
+  - **CreateUserUseCase** — admin-only user creation with explicit role assignment; validates role against `AppRoles`, uses `TryCreate` for atomic uniqueness check; returns `Result<UserDto>`
+  - **GetAllUsersUseCase** — synchronous (`Execute()`), returns all users mapped to `UserDto`
+  - **GetUserByIdUseCase** — synchronous (`Execute(Guid id)`), returns single user by ID or null
+  - **UpdateUserRoleUseCase** — synchronous, validates role against `AppRoles`, prevents changing default admin role; returns `Result<UserDto>`
+  - **DeleteUserUseCase** — synchronous, prevents self-deletion and deletion of default admin account (business rules); returns `Result`
 - Create query/DTO/command objects for each use case input:
-  - Currency: `GetLatestRatesQuery`, `ConvertCurrencyQuery`, `GetHistoricalRatesQuery`, `CurrencyDto`, `LatestRatesDto`, `ConversionResultDto`, `HistoricalRatesDto`
-  - Auth: `LoginCommand`, `RegisterCommand`, `AuthResult`, `UserDto`, `ChangeRoleCommand`, `DeleteUserCommand`
+  - Currency: `GetCurrenciesQuery`, `GetLatestRatesQuery`, `ConvertCurrencyQuery`, `GetHistoricalRatesQuery` (includes `TimezoneOffset`), `CurrencyDto`, `LatestRatesDto`, `ConversionResultDto`, `HistoricalRatesDto`
+  - Auth: `LoginCommand`, `RegisterCommand`, `AuthResult`, `UserDto`, `CreateUserCommand` (Username, Password, Role), `ChangeRoleCommand` (UserId, NewRole), `DeleteUserCommand` (TargetUserId, CurrentUserId)
 - FluentValidation validators:
   - Currency codes: not empty, 3 chars, not in excluded list
   - Amount: greater than zero
-  - Date range: start ≤ end, max span 2 years (730 days), end ≤ today
+  - Date range: start ≤ end, max span 2 years (730 days), end ≤ today (adjusted by timezone offset)
   - Pagination: page ≥ 1, pageSize between 1 and 100
   - `LoginCommandValidator` — username/password not empty
   - `RegisterCommandValidator` — username not empty (max 50 chars), password min 6 / max 128 chars
+  - `CreateUserCommandValidator` — username not empty (max 50 chars), password min 6 / max 128 chars, role must be Admin or User
 
 ### Key Design Decisions
 
 - **Pagination strategy:** Frankfurter API does not support pagination — it returns all dates in a range as one JSON response. Our backend uses range-aware caching: checks which dates are already in Redis, fetches only the missing sub-ranges from Frankfurter, merges everything, and paginates from the combined data using offset/limit. Historical data is immutable, so cached dates never expire.
 - **Excluded currencies in /latest and /historical responses:** Filter them out from rate dictionaries, not just block as base currency. Document this as a design decision.
 - **Use cases vs services:** Separate classes per operation (not one god-service) for testability and SRP.
-- **Auth follows the same Clean Architecture pattern as currency operations:** Domain entities + Application use cases/interfaces + Infrastructure implementations + thin API controllers. Auth business logic (credential validation, self-deletion prevention, role validation) lives in use cases, not controllers.
+- **Result pattern for auth/admin use cases:** Instead of throwing exceptions for business-logic failures (invalid credentials, duplicate username, etc.), auth and admin use cases return `Result<T>` from Domain. This keeps exception handling for truly exceptional situations and provides typed error codes (`INVALID_CREDENTIALS`, `USER_ALREADY_EXISTS`, `SELF_DELETE`, `DEFAULT_ADMIN`, `NOT_FOUND`, `INVALID_ROLE`). Controllers map `Result.IsFailure` to appropriate HTTP status codes.
+- **Auth follows the same Clean Architecture pattern as currency operations:** Domain entities + Application use cases/interfaces + Infrastructure implementations + thin API controllers. Auth business logic (credential validation, self-deletion prevention, default admin protection, role validation) lives in use cases, not controllers.
 
 ---
 
@@ -92,14 +105,14 @@ currency-converter/
 ### 2.1 Frankfurter Provider
 
 - Implement `ICurrencyProvider` as `FrankfurterProvider`
-- **Critical:** Frankfurter uses path-based date format: `GET /{startDate}..{endDate}?base=EUR` — NOT query parameters
-- Currencies list: `GET /currencies` → `{ "EUR": "Euro", "USD": "US Dollar", ... }`
-- Latest rates: `GET /latest?base={currency}`
-- Conversion: `GET /latest?from={source}&to={target}&amount={amount}`
-- Historical: `GET /{start}..{end}?base={currency}`
+- **Critical:** Frankfurter uses `/v1/` prefix and path-based date format: `GET /v1/{startDate}..{endDate}?base=EUR` — NOT query parameters
+- Currencies list: `GET /v1/currencies` → deserialized directly as `Dictionary<string, string>` (no dedicated currencies DTO)
+- Latest rates: `GET /v1/latest?base={currency}`
+- Conversion: `GET /v1/latest?from={source}&to={target}&amount={amount}`
+- Historical: `GET /v1/{start:yyyy-MM-dd}..{end:yyyy-MM-dd}?base={currency}`
 - Create internal DTOs (`FrankfurterLatestResponse`, `FrankfurterTimeSeriesResponse`) for deserialization — these must NOT leak into Domain/Application
 - Map Frankfurter DTOs to Domain models inside the provider
-- Configure via `FrankfurterOptions` (base URL, timeout) from appsettings
+- Configure via `FrankfurterOptions` (BaseUrl default `https://api.frankfurter.dev`, TimeoutSeconds) from appsettings
 
 ### 2.2 Currency Provider Factory
 
@@ -205,7 +218,7 @@ The merge threshold is configured via `appsettings.json` → `CacheSettings:GapM
 
 **Edge cases to handle:**
 - Today's date: if range includes today, always re-fetch today's rates (they are unstable until ~16:00 CET). Exclude today from the fetched sorted set entirely — this guarantees today's data is always re-fetched on every request.
-- Redis unavailability: graceful fallback — log warning, fetch entire range from Frankfurter, return without caching. Cache must never break the app.
+- Redis unavailability: graceful fallback — log warning, fetch entire range from Frankfurter, return without caching. Cache must never break the app. Error escalation: track consecutive failures (`_consecutiveErrors`), escalate log level to Error after threshold (5 consecutive failures).
 - Single remaining gap after merging: trivial case — one request.
 - All gaps merge into one: equivalent to fetching the full range — but only happens when cache is mostly empty, which is expected for first requests.
 
@@ -216,8 +229,9 @@ The merge threshold is configured via `appsettings.json` → `CacheSettings:GapM
   - `GetCachedDatesAsync(baseCurrency, startDate, endDate)` — returns set of already-fetched dates
   - `StoreDateRatesAsync(baseCurrency, date, rates)` — stores a single date's rates
   - `MarkDatesAsFetchedAsync(baseCurrency, dates)` — adds dates to the fetched sorted set
-  - `GetDateRatesBatchAsync(baseCurrency, dates)` — MGET for multiple date keys
-- Implementation lives in Infrastructure; interface in Application
+  - `GetDateRatesBatchAsync(baseCurrency, dates)` — batch GET using Redis pipeline (`CreateBatch`) for multiple date keys
+- Implementation (`RedisCacheService`) lives in Infrastructure; interface in Application
+- `RedisCacheService` injects `IDistributedCache` (for simple key-value), `IConnectionMultiplexer` (for Sorted Set operations), `ILogger`, and `TimeProvider`
 
 ### 2.4 Resilience (Microsoft.Extensions.Http.Resilience)
 
@@ -240,22 +254,24 @@ The merge threshold is configured via `appsettings.json` → `CacheSettings:GapM
 ### 2.5 Auth Implementations
 
 - Create `Auth/` directory in Infrastructure with:
-  - **`JwtTokenService`** — implements `IJwtTokenService`, uses `IOptions<JwtSettings>` from Application layer, generates JWT with claims (`sub`, `name`, `role`, `client_id`, `jti`)
+  - **`JwtTokenService`** — implements `IJwtTokenService`, uses `IOptions<JwtSettings>` + `TimeProvider` from Application layer, generates JWT with claims (`sub`, `ClaimTypes.Name`, `ClaimTypes.Role`, `client_id`, `jti`). Uses `TimeProvider` for token expiration calculation
   - **`BCryptPasswordHasher`** — implements `IPasswordHasher`, uses `BCrypt.Net-Next` for hashing and verification
-  - **`InMemoryUserRepository`** — implements `IUserRepository`, uses `ConcurrentDictionary<Guid, User>` for thread-safe storage, pre-seeds admin user on construction
+  - **`InMemoryUserRepository`** — implements `IUserRepository`, uses `ConcurrentDictionary<Guid, User>` for thread-safe storage. Injects `IPasswordHasher` and `TimeProvider`. Pre-seeds admin user (`admin`/`admin123`) on construction. Uses a `lock` object for thread-safe `TryCreate` (check-and-create atomicity)
 - `BCrypt.Net-Next` and `System.IdentityModel.Tokens.Jwt` packages live in Infrastructure.csproj (not API.csproj)
 
 ### 2.6 DI Registration
 
 - Create `DependencyInjection.cs` extension method in Infrastructure that registers:
-  - `FrankfurterProvider` as `ICurrencyProvider` (keyed/named)
-  - `CurrencyProviderFactory` as `ICurrencyProviderFactory`
-  - `RedisCacheService` as `ICacheService`
+  - `FrankfurterOptions`, `CacheSettings`, `CurrencyProviderSettings` bound from configuration
+  - `CorrelationIdDelegatingHandler` as Transient
+  - Typed `HttpClient` for `ICurrencyProvider`/`FrankfurterProvider` with base URL, timeout, `CorrelationIdDelegatingHandler`, and custom `AddResilienceHandler()` pipeline (exponential backoff + circuit breaker)
+  - `CurrencyProviderFactory` as `ICurrencyProviderFactory` (Transient)
+  - `IConnectionMultiplexer` as Singleton (with `AbortOnConnectFail = false`)
+  - `AddStackExchangeRedisCache` with instance name `CurrencyConverter:`
+  - `RedisCacheService` as `ICacheService` (Singleton)
   - `BCryptPasswordHasher` as `IPasswordHasher` (Singleton)
   - `JwtTokenService` as `IJwtTokenService` (Singleton)
-  - Typed `HttpClient` for Frankfurter with custom `AddResilienceHandler()` pipeline (exponential backoff + circuit breaker)
-  - Redis connection (`AddStackExchangeRedisCache`)
-- Separate `AddInMemoryUserRepository()` extension method registers `InMemoryUserRepository` as `IUserRepository` — called conditionally in `Program.cs` (dev-only guard)
+- Separate `AddInMemoryUserRepository()` extension method registers `InMemoryUserRepository` as `IUserRepository` (Singleton) — called in `Program.cs`
 
 ---
 
@@ -263,31 +279,37 @@ The merge threshold is configured via `appsettings.json` → `CacheSettings:GapM
 
 ### 3.1 Controllers (API v1)
 
-- `CurrenciesController` — `GET /api/v1/currencies` — returns list of available currencies with display names (sourced from Frankfurter `GET /currencies`), with excluded currencies marked as `restricted: true`
-- `RatesController` — `GET /api/v1/rates/latest?base=EUR`; `GET /api/v1/rates/historical?base=EUR&from=2020-01-01&to=2020-01-31&page=1&pageSize=10`
+- `CurrenciesController` — `GET /api/v1/currencies` — returns list of available currencies with display names (sourced from Frankfurter `GET /v1/currencies`), with excluded currencies marked as `restricted: true`
+- `RatesController` — `GET /api/v1/rates/latest?base=EUR`; `GET /api/v1/rates/historical?base=EUR&from=2020-01-01&to=2020-01-31&page=1&pageSize=10&timezoneOffset=0`
 - `ConversionController` — `GET /api/v1/convert?from=EUR&to=USD&amount=100`
-- `AuthController` — `[AllowAnonymous]` for login/register, delegates to `LoginUseCase` / `RegisterUseCase`, validates input via FluentValidation (`LoginCommandValidator`, `RegisterCommandValidator`)
-  - `POST /api/v1/auth/login` — calls `LoginUseCase`, returns `AuthResult(Token, Username, Role)` in response body
-  - `POST /api/v1/auth/register` — calls `RegisterUseCase`, returns `AuthResult(Token, Username, Role)` in response body (201 Created)
-- `UserManagementController` — `[Authorize(Roles = "Admin")]`, delegates to `GetAllUsersUseCase`, `GetUserByIdUseCase`, `UpdateUserRoleUseCase`, `DeleteUserUseCase`
-  - Extracts current user ID from JWT claims, passes to `DeleteUserCommand` for self-deletion prevention
-- Controllers must be thin — only map HTTP request to command/query object, call use case, return result. No business logic in controllers.
-- Return consistent response envelope: `{ data, errors, metadata }`
+- `AuthController` — `[AllowAnonymous]` for login/register, delegates to `LoginUseCase` / `RegisterUseCase`, validates input via FluentValidation. Maps `Result.IsFailure` to appropriate HTTP status codes (401 for `INVALID_CREDENTIALS`, 409 for `USER_ALREADY_EXISTS`)
+  - `POST /api/v1/auth/login` — calls `LoginUseCase`, returns `ApiResponse<AuthResult>` with `AuthResult(Token, Username, Role)` in response body
+  - `POST /api/v1/auth/register` — calls `RegisterUseCase`, returns `ApiResponse<AuthResult>` (201 Created)
+- `UserManagementController` — `[Authorize(Roles = AppRoles.Admin)]`, delegates to `GetAllUsersUseCase`, `GetUserByIdUseCase`, `CreateUserUseCase`, `UpdateUserRoleUseCase`, `DeleteUserUseCase`
+  - `POST /api/v1/admin/users` — admin-only user creation with explicit role assignment, validates via `CreateUserCommandValidator`
+  - `GET /api/v1/admin/users` / `GET /api/v1/admin/users/{id}` — list/get users
+  - `PUT /api/v1/admin/users/{id}/role` — change role (maps `Result` error codes to HTTP status codes)
+  - `DELETE /api/v1/admin/users/{id}` — delete user, extracts current user ID from `ClaimTypes.NameIdentifier` for self-deletion prevention, also prevents deleting default admin
+- Controllers must be thin — only map HTTP request to command/query object, call use case, map `Result` to HTTP response. No business logic in controllers.
+- Success responses use `ApiResponse<T>` envelope: `{ data, metadata }` (no `errors` field in success responses)
+- Error responses use `ErrorResponse` format: `{ type, title, status, detail, errors }` with RFC 7231 problem type URLs
+- Additional API request models in `Models/AuthModels.cs`: `CreateUserRequest(Username, Password, Role)`, `ChangeRoleRequest(Role)`
 
 ### 3.2 JWT Authentication & RBAC
 
 - Configure JWT Bearer authentication via `AddJwtAuthentication()` extension method in `ServiceCollectionExtensions`
 - **Bearer token authentication:** JWT is returned in the response body on login/register; frontend stores it and sends via `Authorization: Bearer <token>` header on subsequent requests
 - `JwtSettings` (Secret, Issuer, Audience, ExpirationMinutes) defined in `Application/Settings/` — shared by both Infrastructure (`JwtTokenService`) and API (`AddJwtBearer`)
-- JWT settings loaded from `appsettings.json` per environment; secret intentionally omitted from base config (only in `appsettings.Development.json` or environment variables for production)
-- Security check: application throws on startup if JWT secret is empty or default
+- JWT settings loaded from `appsettings.json` per environment; secret intentionally set only in `appsettings.Development.json` (development) or environment variables (production)
+- Security check: application throws on startup if JWT secret is empty/whitespace or equals the hardcoded `DefaultJwtSecret` constant
 - Token validation: validate issuer, audience, lifetime, signing key; `ClockSkew = TimeSpan.Zero`
 - Define roles as constants in `Domain/Constants/AppRoles`: `Admin` (full access), `User` (standard access)
 - Auth business logic lives in Application layer use cases (not controllers):
-  - `LoginUseCase` — validates credentials via `IUserRepository` + `IPasswordHasher`, generates JWT via `IJwtTokenService`
-  - `RegisterUseCase` — checks uniqueness, hashes password, creates user, generates token
-  - `DeleteUserUseCase` — enforces self-deletion prevention rule
-  - `UpdateUserRoleUseCase` — validates role against `AppRoles`
+  - `LoginUseCase` — validates credentials via `IUserRepository` + `IPasswordHasher`, generates JWT via `IJwtTokenService`; returns `Result<AuthResult>`
+  - `RegisterUseCase` — checks uniqueness via `TryCreate`, hashes password, creates user, generates token; returns `Result<AuthResult>`
+  - `CreateUserUseCase` — admin-only user creation with explicit role; returns `Result<UserDto>`
+  - `DeleteUserUseCase` — enforces self-deletion prevention and default admin protection rules; returns `Result`
+  - `UpdateUserRoleUseCase` — validates role against `AppRoles`, prevents changing default admin role; returns `Result<UserDto>`
 - Token contains claims: `sub` (user ID), `name`, `role` (using `ClaimTypes.Role` for `[Authorize(Roles)]` compatibility), `client_id`, `jti`
 - Protect all currency endpoints with `[Authorize]`
 - Apply `[Authorize(Roles = AppRoles.Admin)]` to `UserManagementController`
@@ -308,19 +330,16 @@ The merge threshold is configured via `appsettings.json` → `CacheSettings:GapM
 ### 3.4 Structured Logging & Observability
 
 - Serilog with structured logging (JSON sink for Prod, Console for Dev)
-- **Request Logging Middleware** — log for every request:
-  - Client IP (respect `X-Forwarded-For` via `UseForwardedHeaders`)
-  - Client ID (extracted from JWT `client_id` claim)
-  - HTTP method and endpoint path
-  - Response status code
-  - Response time (ms)
+- **Request Logging:** Uses Serilog's built-in `UseSerilogRequestLogging()` with custom `EnrichDiagnosticContext` delegate that enriches each request log with:
+  - `ClientIP` (from `HttpContext.Connection.RemoteIpAddress`, respects `X-Forwarded-For` via `UseForwardedHeaders`)
+  - `ClientId` (extracted from JWT `client_id` claim, defaults to `"anonymous"`)
 - **Correlation ID Middleware:**
   - Read `X-Correlation-ID` from incoming request or generate a new GUID
-  - Push to Serilog `LogContext` so every log line includes it
-  - Attach to outgoing Frankfurter HTTP requests via `DelegatingHandler`
+  - Store in `HttpContext.Items["CorrelationId"]` and push to Serilog `LogContext` so every log line includes it
+  - Attach to outgoing Frankfurter HTTP requests via `CorrelationIdDelegatingHandler`
   - Frankfurter won't echo it back, but our logs will correlate inbound request ↔ outbound call ↔ response
   - Return `X-Correlation-ID` in response headers for client traceability
-- Enrichers: `RequestId`, `MachineName`, `Environment`
+- Enrichers: `ProcessId`, `MachineName`, `EnvironmentName` (via Serilog.Enrichers.Process and Serilog.Enrichers.Environment)
 
 ### 3.5 Global Exception Handling
 
@@ -332,7 +351,7 @@ The merge threshold is configured via `appsettings.json` → `CacheSettings:GapM
   - `ExternalApiException` → 502 Bad Gateway
   - `BrokenCircuitException` / `TimeoutRejectedException` (resilience pipeline) → 503 Service Unavailable
   - Unhandled exceptions → 500 with generic message (no stack trace in Prod)
-- All error responses use consistent JSON format: `{ type, title, status, detail, errors }`
+- All error responses use consistent `ErrorResponse` JSON format: `{ type, title, status, detail, errors }` with RFC 7231 problem type URLs
 - Log every exception with correlation ID
 
 ### 3.6 API Versioning
@@ -344,11 +363,11 @@ The merge threshold is configured via `appsettings.json` → `CacheSettings:GapM
 
 ### 3.7 Multi-Environment Configuration
 
-- `appsettings.json` — shared defaults
-- `appsettings.Development.json` — verbose logging, relaxed rate limits, local Redis
-- `appsettings.Testing.json` — test-specific settings, WireMock URLs
-- `appsettings.Production.json` — minimal logging, strict rate limits, production Redis
-- All secrets (JWT key, Redis connection) should reference environment variables in Prod config
+- `appsettings.json` — shared defaults (Frankfurter options, cache settings, JWT issuer/audience/expiration, rate limiting, CORS, Redis connection string, Serilog)
+- `appsettings.Development.json` — verbose logging, JWT secret (development-only), local Redis `localhost:6379`, `http://localhost:5173` CORS origin
+- `appsettings.Testing.json` — test-specific settings, WireMock URLs, overridden JWT and Redis settings
+- `appsettings.Production.json` — strict rate limits (60/min), minimal Serilog logging (Warning level), File sink. JWT secret loaded from environment variables (not in config file)
+- All secrets (JWT key, Redis connection) should reference environment variables in Prod
 
 ### 3.8 Health Checks
 
@@ -364,8 +383,9 @@ The merge threshold is configured via `appsettings.json` → `CacheSettings:GapM
 
 ### 3.9 CORS
 
-- Configure CORS to allow frontend origin (configurable per environment)
-- No `AllowCredentials()` needed — Bearer token is sent via `Authorization` header, not cookies; explicit origins are still specified for security
+- Configure CORS to allow frontend origin (configurable per environment via `CorsSettings:AllowedOrigins` array)
+- No `AllowCredentials()` needed — Bearer token is sent via `Authorization` header, not cookies
+- Uses `WithOrigins() + AllowAnyHeader() + AllowAnyMethod()` as default policy
 - Dev: allow `http://localhost:5173` (Vite default)
 - Prod: allow only the deployed frontend domain
 
@@ -376,35 +396,42 @@ The merge threshold is configured via `appsettings.json` → `CacheSettings:GapM
 ### 4.1 Unit Tests (target ≥ 90% coverage)
 
 **Domain layer:**
-- `CurrencyRestrictions` — all 4 currencies blocked, valid currencies pass, case-insensitive
-- Model creation and properties (including `User` entity)
-- Auth exception tests (`InvalidCredentialsException`, `UserAlreadyExistsException`)
+- `CurrencyRestrictionsTests` — all 4 currencies blocked, valid currencies pass, case-insensitive
+- `ModelsTests` — model creation and properties (including `User` entity, `Result`/`Result<T>`)
+- `ExceptionTests` — custom exception construction and properties (`CurrencyNotSupportedException`, `ExternalApiException`, `InvalidCredentialsException`, `UserAlreadyExistsException`)
 
 **Application layer (use cases) — the bulk of tests:**
-- `GetLatestRatesUseCase` — cache hit returns cached data; cache miss calls provider then caches; restricted base currency throws; provider failure propagates
-- `ConvertCurrencyUseCase` — happy path; restricted source throws; restricted target throws; zero/negative amount rejected by validator
-- `GetHistoricalRatesUseCase` — pagination math (total count, total pages, correct slice); empty result handling; date range validation; **gap detection logic** (partially cached range returns correct gaps); today's date re-fetch behavior; merging cached + fresh data in correct order
-- `LoginUseCase` — valid credentials return `AuthResult`; unknown user throws `InvalidCredentialsException`; wrong password throws `InvalidCredentialsException`
-- `RegisterUseCase` — successful registration returns `AuthResult`; existing username throws `UserAlreadyExistsException`
-- `GetAllUsersUseCase` — returns all users mapped to DTOs
-- `GetUserByIdUseCase` — returns user when found; returns null when not found
-- `UpdateUserRoleUseCase` — valid role update returns DTO; invalid role throws `ArgumentException`; unknown user returns null
-- `DeleteUserUseCase` — successful deletion returns true; self-deletion throws `InvalidOperationException`; unknown user returns false
-- All validators — boundary values, missing fields, invalid formats (including `LoginCommandValidator`, `RegisterCommandValidator`)
+- `GetCurrenciesUseCaseTests` — cache hit/miss, restricted marking
+- `GetLatestRatesUseCaseTests` — cache hit returns cached data; cache miss calls provider then caches; restricted base currency throws; restricted currencies filtered from rates
+- `ConvertCurrencyUseCaseTests` — happy path; restricted source throws; restricted target throws; amount validated
+- `GetHistoricalRatesUseCaseTests` — pagination math (total count, total pages, correct slice); empty result handling; **gap detection logic** (partially cached range returns correct gaps); today's date re-fetch behavior; merging cached + fresh data in correct order; gap merging with threshold
+- `LoginUseCaseTests` — valid credentials return `Result.Success<AuthResult>`; unknown user returns `Result.Failure` with `INVALID_CREDENTIALS`; wrong password returns `Result.Failure`
+- `RegisterUseCaseTests` — successful registration returns `Result.Success<AuthResult>`; existing username returns `Result.Failure` with `USER_ALREADY_EXISTS`
+- `GetAllUsersUseCaseTests` — returns all users mapped to DTOs
+- `GetUserByIdUseCaseTests` — returns user when found; returns null when not found
+- `UpdateUserRoleUseCaseTests` — valid role update returns `Result.Success<UserDto>`; invalid role returns `Result.Failure`; unknown user returns `Result.Failure`; default admin role change prevented
+- `DeleteUserUseCaseTests` — successful deletion returns `Result.Success`; self-deletion returns `Result.Failure` with `SELF_DELETE`; unknown user returns `Result.Failure` with `NOT_FOUND`; default admin deletion prevented
+- `DtoTests` — DTO construction and property verification
+- Validator tests — boundary values, missing fields, invalid formats for `GetLatestRatesQueryValidator`, `ConvertCurrencyQueryValidator`, `GetHistoricalRatesQueryValidator` (including timezone offset), `LoginCommandValidator`, `RegisterCommandValidator`, `CreateUserCommandValidator`
 
 **Infrastructure layer:**
-- `FrankfurterProvider` — correct URL construction (especially `{start}..{end}` format); response mapping from DTO to domain model; HTTP error handling
-- `CurrencyProviderFactory` — resolves known provider; throws for unknown; uses default when name is null
-- `RedisCacheService` — serialization/deserialization roundtrip; TTL is set correctly for latest rates; graceful handling when Redis is unavailable; **gap detection tests** (fully cached → no gaps; partially cached → correct gaps returned; nothing cached → full range as gap); **gap merging tests** (bridge ≤ threshold → gaps merge into single range; bridge > threshold → gaps stay separate; multiple consecutive small bridges → all merge; single gap → no merging needed); fetched set correctly marks weekends; MGET returns correct subset; today's date excluded from fetched set
-- `JwtTokenService` — generates valid JWT; token contains correct claims (sub, name, role, client_id); correct expiration
-- `BCryptPasswordHasher` — hash produces non-empty result; verify returns true for correct password; verify returns false for wrong password; same input produces different hashes (unique salts)
-- `InMemoryUserRepository` — pre-seeds admin user; CRUD operations (create, getByUsername case-insensitive, getById, getAll, updateRole, delete); thread-safe
+- `FrankfurterProviderTests` + `FrankfurterProviderAdditionalTests` — correct URL construction (especially `/v1/{start}..{end}` format); response mapping from DTO to domain model; HTTP error handling
+- `CurrencyProviderFactoryTests` — resolves known provider; throws for unknown; uses default when name is null
+- `RedisCacheServiceTests` + `RedisCacheServiceAdditionalTests` — serialization/deserialization roundtrip; TTL is set correctly for latest rates; graceful handling when Redis is unavailable; **gap detection tests** (fully cached → no gaps; partially cached → correct gaps returned; nothing cached → full range as gap); fetched set correctly marks weekends; batch GET returns correct subset; today's date excluded from fetched set; error escalation tracking
+- `JwtTokenServiceTests` — generates valid JWT; token contains correct claims (sub, name, role, client_id, jti); correct expiration
+- `BCryptPasswordHasherTests` — hash produces non-empty result; verify returns true for correct password; verify returns false for wrong password; same input produces different hashes (unique salts)
+- `InMemoryUserRepositoryTests` — pre-seeds admin user; CRUD operations (create, TryCreate atomicity, getByUsername case-insensitive, getById, getAll, updateRole, delete); thread-safe
+- `CorrelationIdDelegatingHandlerTests` — attaches correlation ID header to outgoing requests
 
 **API layer:**
-- Controller tests mock use cases (not services) — verify controllers are thin wrappers
-- `AuthController` — delegates to `LoginUseCase`/`RegisterUseCase`, throws exceptions propagated from use cases, validates input via FluentValidation
-- `UserManagementController` — delegates to use cases, extracts current user ID from claims
-- Middleware tests: correlation ID generation, exception-to-status-code mapping (including `InvalidCredentialsException` → 401, `UserAlreadyExistsException` → 409), request logging captures correct fields
+- Controller tests mock use cases (not services) — verify controllers are thin wrappers that map `Result` to HTTP responses
+- `AuthControllerTests` — delegates to `LoginUseCase`/`RegisterUseCase`, maps `Result.IsFailure` to appropriate HTTP status codes (401/409), validates input via FluentValidation
+- `UserManagementControllerTests` — delegates to use cases, extracts current user ID from `ClaimTypes.NameIdentifier`, maps error codes to HTTP status codes
+- `CurrenciesControllerTests`, `RatesControllerTests`, `ConversionControllerTests` — thin wrapper verification
+- `ApiResponseTests` — response envelope construction, `ErrorResponse` factory methods
+- `ConfigurationTests` — DI configuration validation
+- `FrankfurterHealthCheckTests` — health check behavior
+- Middleware tests: `CorrelationIdMiddlewareTests` — correlation ID generation/propagation, `GlobalExceptionHandlingMiddlewareTests` + `GlobalExceptionHandlingMiddlewareAdditionalTests` — exception-to-status-code mapping (including `InvalidCredentialsException` → 401, `UserAlreadyExistsException` → 409, `ValidationException` → 400, `ExternalApiException` → 502, `BrokenCircuitException`/`TimeoutRejectedException` → 503)
 
 ### 4.2 Integration Tests
 
@@ -438,19 +465,20 @@ The merge threshold is configured via `appsettings.json` → `CacheSettings:GapM
 ### 5.1 Project Setup
 
 - Vite + React 19 + TypeScript (strict mode)
-- Tailwind CSS + Shadcn UI for components
-- React Router v7 (library mode) for navigation
+- Tailwind CSS v4 (via `@tailwindcss/vite` plugin, no separate `tailwind.config.js`) + Shadcn UI components (manually placed, no `components.json`)
+- React Router v7 (`react-router-dom`) for navigation
 - **Redux Toolkit** for state management + **RTK Query** for data fetching and caching
+- **react-hook-form** + `@hookform/resolvers` + **Zod** (v4) for form validation
 - **Note:** This is a client-side rendered (CSR) SPA — React Server Components and Server Actions do not apply. React 19 features used in CSR context: improved error handling, `ref` as prop (no `forwardRef`), `use()` hook for context consumption, document metadata support (`<title>`, `<meta>` from components)
 - Project structure following **Feature-Sliced Design (FSD)** methodology:
 
 ```
 src/
 ├── app/
-│   ├── store.ts              # configureStore
+│   ├── store.ts              # setupStore() with combineReducers (supports preloadedState for tests)
 │   ├── hooks.ts              # typed useAppDispatch, useAppSelector
-│   ├── router.tsx            # React Router v7 route configuration
-│   └── providers.tsx         # App-level providers (Redux, Router)
+│   ├── router.tsx            # React Router v7 createBrowserRouter route config
+│   └── providers.tsx         # ErrorBoundary + Redux Provider + RouterProvider + Sonner Toaster
 ├── pages/
 │   ├── login/
 │   │   └── LoginPage.tsx
@@ -471,20 +499,20 @@ src/
 │       └── Layout.tsx
 ├── features/
 │   ├── auth/
-│   │   ├── authSlice.ts      # login state, user info
-│   │   ├── authApi.ts        # RTK Query: login, register, me, logout
-│   │   └── LoginForm.tsx
+│   │   ├── authSlice.ts      # login state, user info, localStorage persistence
+│   │   ├── authApi.ts        # RTK Query: login, register mutations
+│   │   ├── LoginForm.tsx
+│   │   ├── RegisterForm.tsx
+│   │   ├── ProtectedRoute.tsx
+│   │   └── AdminRoute.tsx
 │   ├── conversion/
 │   │   ├── conversionApi.ts  # RTK Query endpoint
 │   │   └── ConversionForm.tsx
 │   ├── historical/
-│   │   ├── historicalApi.ts  # RTK Query endpoint
-│   │   ├── DateRangePicker.tsx
+│   │   ├── historicalApi.ts  # RTK Query endpoint (includes timezoneOffset)
 │   │   └── Pagination.tsx
 │   └── admin/
-│       ├── adminApi.ts       # RTK Query: user CRUD (Admin only)
-│       ├── adminSlice.ts
-│       └── RoleChangeForm.tsx
+│       └── adminApi.ts       # RTK Query: getUsers, createUser, updateUserRole, deleteUser
 ├── entities/
 │   ├── currency/
 │   │   ├── currenciesApi.ts  # RTK Query: getCurrencies
@@ -496,14 +524,22 @@ src/
 │   └── user/
 │       └── types.ts
 ├── shared/
-│   ├── ui/                   # Shadcn UI components
+│   ├── ui/                   # Shadcn UI components (badge, button, card, dialog, ErrorBoundary, input, label, select, skeleton, table, tooltip)
 │   ├── api/
-│   │   └── baseApi.ts        # RTK Query createApi base configuration
+│   │   ├── baseApi.ts        # RTK Query createApi with Bearer auth + reauth wrapper
+│   │   └── types.ts          # ApiResponse<T>, ErrorResponse, unwrapResponse helper
 │   ├── lib/
-│   │   ├── constants.ts
-│   │   └── utils.ts
+│   │   ├── constants.ts      # APP_ROLES, TOKEN_KEY, RESTRICTED_CURRENCIES, PAGE_SIZES, MAX_HISTORICAL_RANGE_DAYS
+│   │   ├── jwt.ts            # JWT decode helper (base64url decode, extract sub/name/role/exp claims)
+│   │   └── utils.ts          # cn() for Tailwind, parseApiError() for error extraction
 │   └── config/
-│       └── env.ts            # VITE_API_URL and other env vars
+│       └── env.ts            # VITE_API_URL (default: http://localhost:5143/api/v1)
+├── test/
+│   ├── mocks/
+│   │   ├── handlers.ts       # MSW request handlers
+│   │   └── server.ts         # MSW server setup
+│   ├── setup.ts              # Vitest setup (jest-dom, MSW)
+│   └── test-utils.tsx        # Custom render with Redux Provider
 └── main.tsx
 ```
 
@@ -511,27 +547,31 @@ src/
 
 ### 5.2 API Client Layer (RTK Query)
 
-- Base API defined via `createApi` with `fetchBaseQuery` — base URL from environment variable (`VITE_API_URL`)
-- `fetchBaseQuery` configured with `prepareHeaders` that reads JWT token from Redux store and injects `Authorization: Bearer <token>` header on every request
-- `baseQueryWithReauth` wrapper: intercept 401 responses → clear token from Redux + localStorage → redirect to `/login`; intercept 429 → show rate limit toast via Sonner
-- **API slices (organized by FSD layers):**
-  - `authApi` (features/auth) — `login`, `register` mutations
+- Base API defined via `createApi` with `fetchBaseQuery` — base URL from environment variable (`VITE_API_URL`, default `http://localhost:5143/api/v1`)
+- `fetchBaseQuery` configured with `prepareHeaders` that reads JWT token from Redux state (`state.auth.token`) and injects `Authorization: Bearer <token>` header on every request
+- `baseQueryWithReauth` wrapper: intercept 401 responses → dispatch `clearAuth()` + dynamically import router + navigate to `/login`; intercept 429 → show rate limit toast via Sonner
+- Tag types: `['Users', 'Currencies', 'Rates']` for cache invalidation
+- Shared `ApiResponse<T>` type and `unwrapResponse()` helper in `shared/api/types.ts` for response envelope unwrapping
+- **API slices (organized by FSD layers, all injected into `baseApi` via `injectEndpoints`):**
+  - `authApi` (features/auth) — `login`, `register` mutations; `onQueryStarted` dispatches `setCredentials` on success
   - `conversionApi` (features/conversion) — `convert({ from, to, amount })` query (lazy, triggered on form submit)
-  - `historicalApi` (features/historical) — `getHistoricalRates({ base, from, to, page, pageSize })` query
-  - `adminApi` (features/admin) — `getUsers`, `updateUserRole`, `deleteUser` (injected only for Admin role)
+  - `historicalApi` (features/historical) — `getHistoricalRates({ base, from, to, page, pageSize, timezoneOffset })` query
+  - `adminApi` (features/admin) — `getUsers`, `createUser`, `updateUserRole`, `deleteUser` (with `providesTags`/`invalidatesTags` for `'Users'` tag)
   - `currenciesApi` (entities/currency) — `getCurrencies` query (cached, rarely invalidated)
   - `ratesApi` (entities/rate) — `getLatestRates(base)` query
 
 ### 5.3 Authentication (Redux + Bearer Token)
 
-- JWT stored in Redux state + persisted to `localStorage` for page refresh survival
+- JWT stored in Redux state + persisted to `localStorage` (key from `TOKEN_KEY` constant) for page refresh survival
 - `authSlice` manages auth state: `{ token: string | null, user: { id, username, role } | null, isAuthenticated: boolean }`
-- **Session rehydration on app startup:** read token from `localStorage`, decode JWT claims (base64 decode) to extract user info, populate `authSlice`; if token is expired → clear state, redirect to login
-- Login page + registration page — both dispatch `authApi` mutations; frontend stores returned `AuthResult.token` in Redux + `localStorage`, extracts user info from response
-- Logout — clear `localStorage` token + dispatch `clearAuth()` — no backend call needed (stateless JWT)
-- `ProtectedRoute` component — reads `isAuthenticated` from Redux store, redirects to `/login` if false
-- `AdminRoute` component — additionally checks `user.role === "Admin"`, redirects to `/` if not Admin
-- Auto-logout on 401 response (handled in `baseQueryWithReauth` — clears Redux state + localStorage, redirects to login)
+- **Session rehydration on app startup:** `loadInitialState()` function reads token from `localStorage`, calls `isTokenExpired()` to check validity, if valid calls `extractUserFromToken()` to decode JWT claims (base64url decode, handles .NET `ClaimTypes.Name` and `ClaimTypes.Role` claim URIs), populates `authSlice`; if token is expired → clears `localStorage`, returns empty state
+- `shared/lib/jwt.ts` — helper functions: `decodeBase64Url`, `decodeJwt`, `isTokenExpired`, `extractUserFromToken` (parses `sub`, `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name`, `http://schemas.microsoft.com/ws/2008/06/identity/claims/role` claims with fallbacks to `name`/`role`)
+- Login page + registration page — both dispatch `authApi` mutations; `onQueryStarted` dispatches `setCredentials` with token + user info on success; `setCredentials` persists token to `localStorage`
+- Logout — dispatch `clearAuth()` → removes from `localStorage` — no backend call needed (stateless JWT)
+- `ProtectedRoute` component — reads `isAuthenticated` from Redux store and checks `isTokenExpired`, redirects to `/login` if not authenticated or token expired
+- `AdminRoute` component — additionally checks `user?.role === APP_ROLES.ADMIN`, redirects to `/` if not Admin
+- Login/Register pages are outside the `Layout` component (no header displayed). Protected pages are wrapped in `Layout` (Header + Outlet)
+- Auto-logout on 401 response (handled in `baseQueryWithReauth` — dispatches `clearAuth()` to clear Redux state + localStorage, dynamically imports router + navigates to `/login`)
 
 ---
 
@@ -572,25 +612,23 @@ src/
 ### 6.4 User Management Page (Admin Only)
 
 - Accessible only to users with `Admin` role — `AdminRoute` wrapper
-- Navigation shows "User Management" link only for Admin users
+- Navigation shows "Users" link only for Admin users
+- Create new user form: username, password, role selector — calls `POST /api/v1/admin/users`
 - Table listing all registered users: username, role, created date
 - Actions per user:
   - Change role (dropdown: `User` / `Admin`) — calls `PUT /api/v1/admin/users/{id}/role`
   - Delete user — confirmation dialog → calls `DELETE /api/v1/admin/users/{id}`
 - Cannot delete own account (UI validation + backend check)
-- RTK Query `adminApi` handles data fetching with automatic cache invalidation on mutations
+- RTK Query `adminApi` handles data fetching with `providesTags: ['Users']` and automatic cache invalidation via `invalidatesTags: ['Users']` on mutations
 
 ### 6.5 Error Handling & UX
 
-- Global error boundary (catches React rendering errors) — use React 19 improved error reporting
-- Toast notifications for API errors (Sonner — lightweight, accessible toast library)
-- Inline form validation messages
-- **Suspense-first loading strategy:**
-  - Wrap data-dependent page sections in `<Suspense fallback={<Skeleton />}>` for declarative loading states
-  - Use RTK Query loading states (`isLoading`, `isFetching`) within Suspense boundaries
-  - Skeleton components for tables (rates, historical, users), spinners for action buttons
-  - Eliminates repetitive `if (isLoading) return <Spinner />` patterns — loading is handled at the boundary level
-- Responsive layout (mobile-friendly)
+- Global `ErrorBoundary` component (`shared/ui/ErrorBoundary.tsx`) wraps the entire app in `providers.tsx` — catches React rendering errors with fallback UI and "Try again" button
+- Toast notifications for API errors and rate limiting (Sonner `<Toaster>` with `position="top-right" richColors`)
+- Inline form validation messages via react-hook-form + Zod
+- Loading states: RTK Query `isLoading`/`isFetching` states used for skeleton components (tables) and spinners (buttons)
+- `parseApiError()` utility in `shared/lib/utils.ts` for consistent error message extraction from API responses
+- Responsive layout (mobile-friendly with Tailwind CSS)
 
 ---
 
@@ -598,14 +636,18 @@ src/
 
 ### 7.1 Component & Integration Tests
 
-- Vitest + React Testing Library
+- Vitest + React Testing Library + MSW (Mock Service Worker)
+- MSW setup in `src/test/` with handlers, server, and custom `renderWithProviders` helper (wraps components in Redux Provider with optional preloaded state)
+- Test files colocated with components in `__tests__/` directories
 - Focus areas:
   - **ConversionForm:** renders correctly, validates excluded currencies, submits with correct params, displays result/error
-  - **HistoricalTable:** renders paginated data, page navigation works, empty state shown
-  - **LoginForm / RegisterForm:** submits credentials, handles error response, verifies token + user info stored in Redux + localStorage on success (token sent via Authorization header)
-  - **UserManagementPage:** renders user list for Admin, role change works, delete with confirmation, non-Admin users cannot access
+  - **HistoricalPage:** renders paginated data, page navigation works, empty state shown
+  - **LoginForm / RegisterForm:** submits credentials, handles error response, form validation with Zod
+  - **UserManagementPage:** renders user list for Admin, role change works, delete with confirmation
   - **ProtectedRoute / AdminRoute:** redirects unauthenticated users, blocks non-Admin from admin pages
-- Mock API calls with MSW (Mock Service Worker) for realistic HTTP mocking
+  - **authSlice:** `setCredentials` / `clearAuth` / `loadInitialState` / localStorage persistence
+  - **jwt.ts:** JWT decode, token expiration check, user extraction from token claims
+- Mock API calls with MSW for realistic HTTP mocking
 - Do NOT test Shadcn UI internals — test behavior, not implementation
 
 ---
@@ -614,44 +656,25 @@ src/
 
 ### 8.1 Docker
 
-- **Backend Dockerfile:** multi-stage build (SDK for build, ASP.NET runtime for run), expose port 8080
-- **Frontend Dockerfile:** multi-stage (Node for build, Nginx for serve), copy built assets to Nginx
-- Nginx config: SPA fallback (`try_files $uri /index.html`), proxy `/api` to backend
-
-### 8.2 Docker Compose
-
-```
-services:
-  backend    → port 8080, depends_on: redis
-  frontend   → port 3000, depends_on: backend
-  redis      → port 6379, persistent volume
-```
-
-- Environment variables for each service
-- Health checks for backend and Redis
-- Dev override file (`docker-compose.override.yml`) with volume mounts for hot reload
+- **Backend Dockerfile** (`backend/Dockerfile`): multi-stage build — SDK 8.0 for restore + publish, ASP.NET 8.0 runtime for run. Sets `ASPNETCORE_ENVIRONMENT=Production`. Entrypoint: `dotnet CurrencyConverter.API.dll`
+- **Frontend Dockerfile** (`frontend/Dockerfile`): multi-stage — Node 20 Alpine for install + build (accepts `VITE_API_URL` build arg), Nginx Alpine for serve. Inline Nginx config template with SPA fallback (`try_files $uri $uri/ /index.html`). Exposes port 80
+- **Note:** No `docker-compose.yml` exists in the repository. Services are intended to be run individually or orchestrated externally
 
 ### 8.3 CI/CD Pipeline (GitHub Actions)
 
-Provide a `.github/workflows/ci.yml` that demonstrates CI/CD readiness:
+Separate workflow files in `.github/workflows/`:
 
-**Backend pipeline (`backend-ci`):**
-1. **Trigger:** on push/PR to `main` — changes in `backend/` directory
-2. **Build:** `dotnet restore` → `dotnet build` — verify compilation
-3. **Test:** `dotnet test` with Coverlet code coverage collection — fail if coverage < 90%
-4. **Coverage report:** upload Cobertura report as pipeline artifact; optionally post summary to PR
+**Backend pipeline** (`.github/workflows/backend-tests.yml` — "Backend Build & Test"):
+1. **Trigger:** on `pull_request` to `main` — changes in `backend/**`
+2. **Build job:** `dotnet restore` → `dotnet build --configuration Release` — verify compilation
+3. **Test job** (depends on Build): `dotnet test` on unit tests project (`CurrencyConverter.UnitTests`) only — no coverage threshold enforcement in CI
 
-**Frontend pipeline (`frontend-ci`):**
-1. **Trigger:** on push/PR to `main` — changes in `frontend/` directory
-2. **Install:** `npm ci` — deterministic dependency install
-3. **Lint:** `npm run lint` — ESLint + TypeScript type check
-4. **Test:** `npm run test` — Vitest with coverage
-5. **Build:** `npm run build` — verify production build succeeds
+**Frontend pipeline** (`.github/workflows/frontend-tests.yml` — "Frontend Build & Test"):
+1. **Trigger:** on `pull_request` to `main` — changes in `frontend/**`
+2. **Build job:** `npm ci` → `npm run build` — verify production build succeeds
+3. **Test job** (depends on Build): `npm ci` → `npm test` — run Vitest unit tests
 
-**Integration pipeline (`integration-ci`):**
-1. **Trigger:** on push/PR to `main` — runs after both backend and frontend pipelines
-2. **Services:** spin up Redis via `services:` block in GitHub Actions
-3. **Run:** backend integration tests with WireMock + real Redis (Testcontainers)
+**Note:** No separate integration test pipeline exists in CI. Integration tests (with Testcontainers.Redis + WireMock.Net) are available locally but not automated in GitHub Actions
 
 ### 8.4 README.md
 
@@ -689,7 +712,7 @@ Provide a `.github/workflows/ci.yml` that demonstrates CI/CD readiness:
 | Resilience misconfiguration | Wrong policy order or conflicting timeouts | Custom `AddResilienceHandler()` with explicitly defined order: Total Timeout → Retry → Circuit Breaker → Attempt Timeout |
 | Rate limiting under Redis failure | No rate limiting if Redis is down | `RedisRateLimiting` falls back to in-memory rate limiting with logged warning |
 | MemoryCache vs horizontal scaling | Inconsistent cache across instances | Using Redis (IDistributedCache) solves this |
-| Concurrent cache miss (thundering herd) | N parallel requests to Frankfurter for same data | Implement cache-aside with Redis distributed lock (SET NX EX) — only first request fetches, others wait for cache |
+| Concurrent cache miss (thundering herd) | N parallel requests to Frankfurter for same data | Not explicitly mitigated with distributed locks in current implementation. Range-aware caching reduces the window, but concurrent first requests for the same uncached range may result in duplicate Frankfurter calls. Future improvement: add Redis distributed lock (SET NX EX) |
 | Gap detection complexity | Incorrect sub-range calculation or missed dates | Thorough unit tests for gap detection and gap merging; mark weekends/holidays as fetched to prevent re-querying |
 | Over-splitting requests | N small HTTP calls slower than 1 larger call | Gap merging with configurable threshold (default 5 days); merge small bridges between gaps |
 | Today's rates in historical range | Stale data cached permanently | Exclude today from "fetched" set; always re-fetch today's rates on each request |

@@ -119,58 +119,91 @@ Rewrite entirely for Bearer token approach:
 ```
 frontend/
 ├── src/
-│   ├── app/          # store, hooks, router, providers
-│   ├── pages/        # 6 page components
-│   ├── widgets/      # Header, Layout
-│   ├── features/     # auth, conversion, historical, admin
-│   ├── entities/     # currency, rate, user types
-│   ├── shared/       # ui (shadcn), api, lib, config
+│   ├── app/              # store.ts, hooks.ts, router.tsx, providers.tsx
+│   ├── pages/
+│   │   ├── admin/        # UserManagementPage.tsx (+ __tests__/)
+│   │   ├── convert/      # ConvertPage.tsx
+│   │   ├── historical/   # HistoricalPage.tsx (+ __tests__/)
+│   │   ├── login/        # LoginPage.tsx
+│   │   ├── rates/        # RatesPage.tsx
+│   │   └── register/     # RegisterPage.tsx
+│   ├── widgets/
+│   │   ├── header/       # Header.tsx
+│   │   └── layout/       # Layout.tsx
+│   ├── features/
+│   │   ├── auth/         # authSlice.ts, authApi.ts, LoginForm.tsx, RegisterForm.tsx, ProtectedRoute.tsx, AdminRoute.tsx (+ __tests__/)
+│   │   ├── conversion/   # conversionApi.ts, ConversionForm.tsx (+ __tests__/)
+│   │   ├── historical/   # historicalApi.ts, Pagination.tsx
+│   │   └── admin/        # adminApi.ts
+│   ├── entities/
+│   │   ├── currency/     # types.ts, currenciesApi.ts, CurrencySelector.tsx
+│   │   ├── rate/         # types.ts, ratesApi.ts
+│   │   └── user/         # types.ts
+│   ├── shared/
+│   │   ├── api/          # baseApi.ts, types.ts
+│   │   ├── config/       # env.ts
+│   │   ├── lib/          # constants.ts, jwt.ts, utils.ts (+ __tests__/)
+│   │   └── ui/           # badge, button, card, dialog, ErrorBoundary, input, label, select, skeleton, table, tooltip
+│   ├── test/             # mocks/handlers.ts, mocks/server.ts, setup.ts, test-utils.tsx
+│   ├── index.css
 │   └── main.tsx
 ├── index.html
 ├── vite.config.ts
+├── vitest.config.ts
 ├── tsconfig.json
-├── tailwind.config.js
-├── components.json   # shadcn config
+├── tsconfig.app.json
+├── tsconfig.node.json
+├── eslint.config.js
 └── package.json
 ```
 
-**Dependencies:** react 19, react-dom 19, react-router 7, @reduxjs/toolkit, react-redux, tailwindcss, @radix-ui/*, class-variance-authority, clsx, tailwind-merge, lucide-react, sonner, zod, date-fns
+Note: RTK Query API endpoints follow FSD principles — domain-specific queries (`currenciesApi`, `ratesApi`) are in `entities/`, while feature-specific endpoints (`authApi`, `conversionApi`, `historicalApi`, `adminApi`) are in `features/`. All inject into the shared `baseApi`.
 
-**Dev dependencies:** vite, typescript, @types/react, @types/react-dom, @vitejs/plugin-react, eslint, vitest, @testing-library/react, @testing-library/jest-dom, @testing-library/user-event, msw, jsdom, postcss, autoprefixer
+Note: Tailwind CSS v4 configured via `@tailwindcss/vite` plugin (no separate `tailwind.config.js`). Shadcn UI components manually placed in `shared/ui/` (no `components.json`).
+
+**Dependencies:** react 19, react-dom 19, react-router-dom 7, @reduxjs/toolkit, react-redux, react-hook-form, @hookform/resolvers, class-variance-authority, clsx, tailwind-merge, lucide-react, sonner, zod 4, date-fns
+
+**Dev dependencies:** vite, @vitejs/plugin-react, typescript, @types/react, @types/react-dom, @types/node, @tailwindcss/vite, tailwindcss, eslint, @eslint/js, eslint-plugin-react-hooks, eslint-plugin-react-refresh, typescript-eslint, globals, vitest, @testing-library/react, @testing-library/jest-dom, @testing-library/user-event, msw, jsdom
 
 #### 5.2 Core Infrastructure Files
 
-1. **`shared/config/env.ts`** — export `VITE_API_URL` (default `http://localhost:5080/api/v1`)
+1. **`shared/config/env.ts`** — export `API_BASE_URL` from `import.meta.env.VITE_API_URL` (default `http://localhost:5143/api/v1`)
 2. **`shared/api/baseApi.ts`** — RTK Query `createApi` with `fetchBaseQuery`:
 
-   - `baseUrl` from env
-   - `prepareHeaders`: read token from Redux state, inject `Authorization: Bearer <token>`
-   - Wrap in `baseQueryWithReauth`: intercept 401 → `clearAuth()` + redirect; intercept 429 → show Sonner toast
+   - `baseUrl` from `API_BASE_URL`
+   - `prepareHeaders`: read token from Redux state (`(getState() as RootState).auth.token`), inject `Authorization: Bearer <token>`
+   - Wrap in `baseQueryWithReauth`: intercept 401 → dispatch `clearAuth()` + dynamically import router + `router.navigate('/login')`; intercept 429 → show Sonner `toast.error`
+   - Tag types: `['Users', 'Currencies', 'Rates']`
 
-3. **`app/store.ts`** — `configureStore` with RTK Query middleware and all API reducers + `authSlice`
-4. **`app/hooks.ts`** — typed `useAppDispatch`, `useAppSelector`
-5. **`app/router.tsx`** — React Router v7 route config (6 pages + `ProtectedRoute` + `AdminRoute`)
-6. **`app/providers.tsx`** — `<Provider store={store}>` + `<RouterProvider>` + `<Toaster>` (Sonner)
+3. **`shared/api/types.ts`** — `ApiResponse<T>` type, `ErrorResponse` type, `unwrapResponse()` helper for response envelope unwrapping
+4. **`app/store.ts`** — `setupStore()` function with `combineReducers` (supports `preloadedState` for tests), exports `store`, `RootState`, `AppDispatch`
+5. **`app/hooks.ts`** — typed `useAppDispatch`, `useAppSelector`
+6. **`app/router.tsx`** — React Router v7 `createBrowserRouter` config — Login/Register outside Layout, protected pages inside `ProtectedRoute` + `Layout` wrapper, admin pages inside `AdminRoute`
+7. **`app/providers.tsx`** — `<ErrorBoundary>` + `<Provider store={store}>` + `<RouterProvider>` + `<Toaster position="top-right" richColors />`
 
 #### 5.3 Auth Layer
 
 - **`features/auth/authSlice.ts`**:
   - State: `{ token, user: { id, username, role } | null, isAuthenticated }`
-  - Actions: `setCredentials(token, user)`, `clearAuth()`
-  - On `setCredentials`: persist token to `localStorage`
+  - Actions: `setCredentials({ token, user })`, `clearAuth()`
+  - On `setCredentials`: persist token to `localStorage` (using `TOKEN_KEY` constant)
   - On `clearAuth`: remove from `localStorage`
-  - `initialState`: attempt to read token from `localStorage`, decode user info via JWT claims parsing (base64 decode, no crypto needed — just reading claims)
+  - `loadInitialState()` function (called for `initialState`): attempt to read token from `localStorage`, call `isTokenExpired()` to check validity, if valid call `extractUserFromToken()` to decode user info; if expired → clear `localStorage`, return empty state
 - **`features/auth/authApi.ts`** — RTK Query endpoints injected into `baseApi`:
   - `login` mutation: `POST /auth/login`
   - `register` mutation: `POST /auth/register`
-  - `onQueryStarted` for both: on success, dispatch `setCredentials` with token + user
-- **`features/auth/LoginForm.tsx`** + **`features/auth/RegisterForm.tsx`** — form components with Zod validation
-- **`shared/lib/jwt.ts`** — helper to decode JWT payload (base64url decode, extract `sub`, `name`, `role`, `exp`)
+  - `onQueryStarted` for both: on success, unwrap response → extract `token`, `username`, `role` → call `extractUserFromToken(token)` → dispatch `setCredentials({ token, user })`
+- **`features/auth/LoginForm.tsx`** + **`features/auth/RegisterForm.tsx`** — form components with `react-hook-form` + `zodResolver` for validation, handle `isLoading` and `serverError` states
+- **`shared/lib/jwt.ts`** — helper functions:
+  - `decodeBase64Url(str)` — base64url to string
+  - `decodeJwt(token)` — splits JWT, decodes payload, returns `JwtPayload` or null
+  - `isTokenExpired(token)` — checks `exp` claim against `Date.now()`
+  - `extractUserFromToken(token)` — extracts `AuthUser` from JWT claims, handles .NET `ClaimTypes` URIs (`http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name`, `http://schemas.microsoft.com/ws/2008/06/identity/claims/role`) with fallbacks to `name`/`role`
 
 #### 5.4 Route Guards
 
-- **`features/auth/ProtectedRoute.tsx`** — reads `isAuthenticated` from store, redirects to `/login` if false
-- **`features/auth/AdminRoute.tsx`** — additionally checks `user.role === "Admin"`, redirects to `/` if not
+- **`features/auth/ProtectedRoute.tsx`** — reads `isAuthenticated` and `token` from store, checks `isTokenExpired(token)`, redirects to `/login` if not authenticated or token expired
+- **`features/auth/AdminRoute.tsx`** — additionally checks `user?.role === APP_ROLES.ADMIN`, redirects to `/` if not Admin
 
 ---
 
@@ -178,8 +211,8 @@ frontend/
 
 #### 6.1 Layout and Navigation (`widgets/`)
 
-- **`Header.tsx`** — app title, nav links (Convert, Rates, Historical), conditional "Users" link for Admin, username display, Logout button
-- **`Layout.tsx`** — Header + `<Outlet />`, Sonner `<Toaster />`
+- **`widgets/header/Header.tsx`** — app title with DollarSign icon, nav links with icons (Convert, Rates, Historical), conditional "Users" link for Admin, username + role display, Logout button (dispatches `clearAuth()` + navigates to `/login`)
+- **`widgets/layout/Layout.tsx`** — Header + `<Outlet />` inside container div (no Toaster here — Toaster is in `app/providers.tsx`)
 
 #### 6.2 Login Page (`pages/login/`)
 
@@ -196,57 +229,64 @@ frontend/
 
 #### 6.4 Convert Page (`pages/convert/`)
 
-- Form: amount input, source currency dropdown, target currency dropdown
-- Dropdowns populated from `GET /currencies` — restricted currencies shown as disabled with tooltip
-- Client-side validation: amount > 0, source != target, not restricted
-- Result display: converted amount, rate, date
-- Uses `conversionApi.convert` (lazy query, triggered on submit)
+- `ConversionForm` component with `react-hook-form` + `zodResolver` (Zod schema validates: from/to required, amount > 0, source ≠ target)
+- `CurrencySelector` dropdowns populated from `GET /currencies` — restricted currencies shown as disabled with tooltip
+- Uses `useLazyConvertQuery` from `conversionApi` — triggered on form submit
+- Error display: both validation errors (per-field) and `serverError` (from API, parsed via `parseApiError`)
+- Result display card: large converted amount, original-to-converted equation, rate + date info
 
 #### 6.5 Latest Rates Page (`pages/rates/`)
 
-- Base currency dropdown selector
-- Table of rates for selected currency (code + rate value)
-- Restricted currencies visually marked (grayed row with icon)
-- Manual refresh button
-- Loading skeleton for table
+- Base currency selector (`CurrencySelector` component) + manual refresh button (RefreshCw icon, spins during fetch)
+- Uses `ratesApi` from `entities/rate/ratesApi.ts` (not in `features/`)
+- Table of rates: sorted alphabetically by code, shows code + rate value (4-6 decimal places)
+- Restricted currencies shown with reduced opacity and "restricted" badge
+- Last updated date displayed in card description
+- Loading skeleton for table (8 skeleton rows)
 
 #### 6.6 Historical Rates Page (`pages/historical/`)
 
-- Date range picker (start, end) with validation: start <= end, max 730 days, end <= today
-- Base currency selector
-- Paginated table with page controls (Prev/Next/page numbers)
-- Page size selector (10/25/50)
-- Total records count + current page info
-- Empty state handling
+- Form with: base currency selector, date range picker (start, end) with native `<input type="date">`, "Search" button
+- Client-side validation: start <= end, max 730 days (`MAX_HISTORICAL_RANGE_DAYS`), end <= today
+- Sends `timezoneOffset: new Date().getTimezoneOffset()` with every query
+- Search triggers state update (`searchParams`), query skips until search is executed
+- Paginated table: Date, Currency Count, Sample Rate (USD or first available)
+- Page size selector (10/25/50 from `PAGE_SIZES` constant) — resets page to 1 on change
+- `Pagination` component with page controls (Prev/Next/page numbers), total count
+- Empty state and skeleton loading
 
 #### 6.7 User Management Page (`pages/admin/`)
 
 - `AdminRoute` wrapper
-- Table: username, role, created date
-- Actions: Change role (dropdown User/Admin), Delete (confirmation dialog)
-- Cannot delete own account (disable button + tooltip)
-- RTK Query cache invalidation on mutations
+- "Add User" button opens Create User dialog (username, password, role fields)
+- Table: username (with "You" badge for current user, "Default Admin" badge), role, created date, actions
+- Role change: native `<Select>` dropdown (User/Admin) — disabled for default admin (shown as text with tooltip)
+- Delete: confirmation dialog — disabled for own account and default admin (with tooltip explaining why)
+- `adminApi` endpoints: `getUsers`, `createUser`, `updateUserRole`, `deleteUser` — all with `'Users'` tag for cache invalidation
+- Toast notifications (Sonner) for success/error on create, role change, and delete
 
-#### 6.8 Shadcn UI Components Needed
+#### 6.8 Shadcn UI Components Used
 
-Install via CLI: `button`, `input`, `label`, `select`, `table`, `card`, `dialog`, `dropdown-menu`, `badge`, `skeleton`, `tooltip`, `separator`, `form` (optional — or use native + Zod)
+Manually placed in `shared/ui/`: `badge`, `button`, `card`, `dialog`, `input`, `label`, `select`, `skeleton`, `table`, `tooltip`, plus custom `ErrorBoundary` component
 
 ---
 
 ### Phase 7 — Testing
 
 - **Vitest + React Testing Library + MSW**
-- MSW handlers mock all 9 API endpoints with realistic response shapes
-- Test files colocated next to components or in `__tests__/` directories
+- MSW handlers (`test/mocks/handlers.ts`) mock 9 API endpoints with realistic response shapes (missing: `POST /admin/users` create)
+- Test setup: `test/setup.ts` (jsdom, MSW beforeAll/afterEach/afterAll), `test/test-utils.tsx` (custom `renderWithProviders` wrapping Redux store)
+- Test files in `__tests__/` directories colocated with features/pages
 - Key test scenarios:
-  - `LoginForm`: submit, error handling, token stored in Redux
-  - `RegisterForm`: submit, validation, error handling
-  - `ConversionForm`: renders, validates restricted currencies, displays result
-  - `HistoricalTable`: paginated data, page navigation, empty state
-  - `ProtectedRoute` / `AdminRoute`: redirect behavior
-  - `UserManagementPage`: renders list, role change, delete confirmation
-  - `authSlice`: setCredentials / clearAuth / localStorage persistence
-  - `baseQueryWithReauth`: 401 interception clears auth
+  - `features/auth/__tests__/LoginForm.test.tsx`: submit with valid credentials, handle 401 error, display token in Redux
+  - `features/auth/__tests__/RegisterForm.test.tsx`: submit, validation, handle conflict error
+  - `features/auth/__tests__/authSlice.test.ts`: setCredentials / clearAuth / localStorage persistence
+  - `features/auth/__tests__/ProtectedRoute.test.tsx`: redirect behavior for unauthenticated users
+  - `features/auth/__tests__/AdminRoute.test.tsx`: redirect for non-admin users
+  - `features/conversion/__tests__/ConversionForm.test.tsx`: renders, validates, displays conversion result
+  - `pages/historical/__tests__/HistoricalPage.test.tsx`: paginated data display, date validation
+  - `pages/admin/__tests__/UserManagementPage.test.tsx`: renders list, role change, delete confirmation
+  - `shared/lib/__tests__/jwt.test.ts`: JWT decode, expiration check, user extraction
 
 ---
 
@@ -260,9 +300,10 @@ POST /auth/login        body: { username, password }     → { data: { token, us
 POST /auth/register     body: { username, password }     → 201 { data: { token, username, role } }
 GET  /currencies                                         → { data: [{ code, name, isRestricted }] }
 GET  /rates/latest?base=EUR                              → { data: { baseCurrency, date, rates } }
-GET  /rates/historical?base=EUR&from=...&to=...&page&pageSize → { data: { baseCurrency, rates, totalCount, page, pageSize, totalPages, hasNextPage, hasPreviousPage }, metadata: {...} }
+GET  /rates/historical?base=EUR&from=...&to=...&page&pageSize&timezoneOffset=-180 → { data: { baseCurrency, rates, totalCount, page, pageSize, totalPages, hasNextPage, hasPreviousPage }, metadata: {...} }
 GET  /convert?from=EUR&to=USD&amount=100                 → { data: { from, to, amount, result, rate, date } }
 GET  /admin/users                                        → { data: [{ id, username, role, createdAt }] }
+POST /admin/users            body: { username, password, role } → 201 { data: { id, username, role, createdAt } }
 GET  /admin/users/{id}                                   → { data: { id, username, role, createdAt } }
 PUT  /admin/users/{id}/role  body: { role }              → { data: { id, username, role, createdAt } }
 DELETE /admin/users/{id}                                 → 204
