@@ -26,6 +26,8 @@
 ## Environment (deployed to railway.com)
 <img width="647" height="419" alt="image" src="https://github.com/user-attachments/assets/c47ca951-9650-4167-a01c-a53fa4bd6fdb" />
 
+https://currency-converter-ui.up.railway.app/
+
 Admin login / password: admin / admin123
 ---
 
