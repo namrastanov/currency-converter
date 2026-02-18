@@ -3,16 +3,16 @@
 ## Architecture
 
 ```
-┌─────────────────────┐       ┌──────────────────────────────────────────┐
-│                     │       │            ASP.NET Core API              │
+┌─────────────────────┐       ┌─────────────────────────────────────────┐
+│                     │       │            ASP.NET Core API             │
 │   React SPA         │       │                                         │
 │   (Vite + Redux     │ HTTP  │  Controllers ──► UseCases ──► Domain    │
-│    Toolkit)          ├──────►│       │                        │        │
+│    Toolkit)         ├──────►│       │                        │        │
 │                     │       │       ▼                        ▼        │
 │   Feature-Sliced    │◄──────┤  Middleware        Infrastructure       │
-│   Design            │  JSON │  (Auth, Errors,         │              │
-│                     │       │   CORS, Rate Limit)     │              │
-└─────────────────────┘       └─────────────────────────┼──────────────┘
+│   Design            │  JSON │  (Auth, Errors,         │               │
+│                     │       │   CORS, Rate Limit)     │               │
+└─────────────────────┘       └─────────────────────────┼───────────────┘
                                                         │
                                           ┌─────────────┼─────────────┐
                                           │             │             │
